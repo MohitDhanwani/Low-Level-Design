@@ -4,13 +4,26 @@
 #include <thread>
 #include <string>
 #include <memory>
+#include <chrono>
 using namespace std;
+
+/*
+- Add Expiration Time Logic (TTL) - DONE
+- Add Support for multiple data structures (vectors, sets, lists, queue)
+*/
+
+struct ValueWithTTL {
+    string value;
+    chrono::steady_clock::time_point expiresAt;
+};
+
+const int DEFAULT_KEY_EXPIRATION_TIME = 300; // in seconds
 
 // 1. INTERFACE LAYER (Open/Closed Principle - OCP)
 class IStorageEngine {
 public:
     virtual pair<bool, string> GET(const string& key) = 0;
-    virtual bool PUT(const string& key, const string& value) = 0;
+    virtual bool PUT(const string& key, const string& value, int ttlInSeconds = DEFAULT_KEY_EXPIRATION_TIME) = 0;
     virtual bool DELETE(const string& key) = 0;
     virtual bool PATCH(const string& key, const string& newValue) = 0;
     virtual unordered_map<string, string> GETALL() = 0;
@@ -21,29 +34,36 @@ public:
 // No console outputs (cout) here. Pure raw database operations.
 class InMemoryStorageEngine : public IStorageEngine {
 private:
-    unordered_map<string, string> keyToValue;
+    unordered_map<string, ValueWithTTL> keyToValue;
     mutex mtx; // Thread safety lock
 
 public:
     InMemoryStorageEngine() {
-        cout << "In Memory Storage Engine Created..." << endl;
+        cout << "In Memory Storage Engine Created!" << endl;
     }
 
     pair<bool, string> GET(const string& key) override {
         lock_guard<mutex> lock(mtx); // automatically releases the lock once function returns the value
         auto it = keyToValue.find(key);
+
         if (it != keyToValue.end()) {
-            return {true, it->second};
+            if (chrono::steady_clock::now() > it->second.expiresAt) {
+                keyToValue.erase(it);
+                return {false, ""};
+            }
+            return {true, it->second.value};
         }
         return {false, ""};
     }
 
-    bool PUT(const string& key, const string& value) override {
+    bool PUT(const string& key, const string& value, int ttlInSeconds) override {
         lock_guard<mutex> lock(mtx);
         if (keyToValue.find(key) != keyToValue.end()) {
             return false; // Key already exists
         }
-        keyToValue[key] = value;
+
+        auto expiryTime = chrono::steady_clock::now() + chrono::seconds(ttlInSeconds);
+        keyToValue[key] = {value, expiryTime};
         return true;
     }
 
@@ -63,13 +83,32 @@ public:
         if (it == keyToValue.end()) {
             return false; // Key not found to update
         }
-        keyToValue[key] = newValue;
+        
+        // Check if the key has already expired before patching
+        if (chrono::steady_clock::now() > it->second.expiresAt) {
+            keyToValue.erase(it);
+            return false; 
+        }
+
+        it->second.value = newValue; 
         return true;
     }
 
     unordered_map<string, string> GETALL() override {
         lock_guard<mutex> lock(mtx);
-        return keyToValue; // Returns a thread-safe snapshot copy
+        unordered_map<string, string> validSnapshot;
+
+        auto now = chrono::steady_clock::now();
+
+        for (auto it = keyToValue.begin(); it != keyToValue.end(); ) {
+            if (now > it->second.expiresAt) {
+                it = keyToValue.erase(it); 
+            } else {
+                validSnapshot[it->first] = it->second.value;
+                ++it;
+            }
+        }
+        return validSnapshot;
     }
 };
 
@@ -95,8 +134,8 @@ public:
         }
     }
 
-    void handlePut(const string& key, const string& value) {
-        if (storage->PUT(key, value)) {
+    void handlePut(const string& key, const string& value, int ttlInSeconds = DEFAULT_KEY_EXPIRATION_TIME) {
+        if (storage->PUT(key, value, ttlInSeconds)) {
             cout << "PUT Success | " << key << " inserted cleanly." << endl;
         } else {
             cout << "PUT Error   | Key '" << key << "' already exists." << endl;
@@ -140,7 +179,11 @@ int main() {
 
     cout << "STARTING BASIC FUNCTIONALITY TESTS" << endl;
     redis->handlePut("user1", "{name: mohit, age:18}");
-    redis->handlePut("user1", "{duplicate entry attempt}"); // Should fail 
+    redis->handlePut("user1", "{duplicate entry attempt}"); // Should fail
+    
+    // Testing PUT with expiration time
+    redis->handlePut("user1", "{duplicate entry attempt}", 50); 
+
     redis->handleGet("user1");
     redis->handlePatch("user1", "{name: mohit, age:19}");
     redis->handleGet("user1");
@@ -152,27 +195,50 @@ int main() {
     
     // Test 1: Simultaneous Writes
     cout << "TEST 1: Simultaneous Writes" << endl;
-    thread t1(redis, "user_t1", "{data: dynamic_1}", "Thread_1");
-    thread t2(redis, "user_t2", "{data: dynamic_2}", "Thread_2");
+    thread t1(&KeyValueService::handlePut, redis, "user_t1", "{data: dynamic_1}", DEFAULT_KEY_EXPIRATION_TIME);
+    thread t2(&KeyValueService::handlePut, redis, "user_t2", "{data: dynamic_2}", DEFAULT_KEY_EXPIRATION_TIME);
     t1.join();
     t2.join();
 
     // Test 2: Simultaneous Patches
     cout << "TEST 2: Simultaneous Updates (Same Key)" << endl;
-    thread t3(redis, "user_test", "{name: altered_by_T3}", "Thread_3");
-    thread t4(redis, "user_test", "{name: altered_by_T4}", "Thread_4");
+    thread t3(&KeyValueService::handlePatch, redis, "user_test", "{name: altered_by_T3}");
+    thread t4(&KeyValueService::handlePatch, redis, "user_test", "{name: altered_by_T4}");
     t3.join();
     t4.join();
 
     // Test 3: Simultaneous Read & Patch
     cout << "TEST 3: Simultaneous Read and Update" << endl;
-    thread t5(redis, "user_test", "Thread_5_Reader");
-    thread t6(redis, "user_test", "{name: complete_final_value}", "Thread_6_Patcher");
+    thread t5(&KeyValueService::handleGet, redis, "user_test");
+    thread t6(&KeyValueService::handlePatch, redis, "user_test", "{name: complete_final_value}");
     t5.join();
     t6.join();
 
     cout << "VERIFYING ABSOLUTE FINAL DB STATE" << endl;
     redis->printAll();
+    cout << endl;
+    
+
+    cout << "STARTING TTL EXPIRED TESTS" << endl;
+    redis->handlePut("short_key", "{data: disappears fast}", 2);
+    redis->handlePut("long_key", "{data: stays a bit longer}", 5);
+
+    cout << "Checking immediately:" << endl;
+    redis->handleGet("short_key"); // Should exist
+    redis->handleGet("long_key");  // Should exist
+
+    cout << "Sleeping for 3 seconds..." << endl;
+    this_thread::sleep_for(chrono::seconds(3));
+
+    cout << "Checking after 3 seconds:" << endl;
+    redis->handleGet("short_key"); // Should fail (expired)
+    redis->handleGet("long_key");  // Should still exist
+
+    cout << "Sleeping for another 3 seconds" << endl;
+    this_thread::sleep_for(chrono::seconds(3));
+
+    cout << "Checking after 6 seconds total:" << endl;
+    redis->handleGet("long_key");
 
     return 0;
 }
