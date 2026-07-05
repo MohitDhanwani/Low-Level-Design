@@ -8,7 +8,6 @@
 using namespace std;
 
 /*
-- Add Expiration Time Logic (TTL) - DONE
 - Add Support for multiple data structures (vectors, sets, lists, queue)
 */
 
